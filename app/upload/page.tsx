@@ -25,91 +25,49 @@ export default function UploadPage() {
     const fileInput = form.querySelector('input[type="file"]') as HTMLInputElement;
     const file = fileInput.files?.[0];
 
-    // Validaciones iniciales
-    if (!file) {
-      toast.error('Por favor selecciona un archivo');
-      return;
-    }
-
-    if (!ALLOWED_FILE_TYPES.includes(file.type)) {
-      toast.error('Solo se permiten archivos PDF');
-      return;
-    }
-
-    if (file.size > MAX_FILE_SIZE) {
-      toast.error('El archivo no debe superar los 10MB');
-      return;
-    }
-
-    // Validar URL del webhook
-    if (!process.env.NEXT_PUBLIC_N8N_WEBHOOK_URL) {
-      toast.error('Error de configuración: URL del webhook no definida');
-      return;
-    }
-
     try {
+      // Validaciones iniciales
+      if (!file) throw new Error('Por favor selecciona un archivo');
+      if (!ALLOWED_FILE_TYPES.includes(file.type)) throw new Error('Solo se permiten archivos PDF');
+      if (file.size > MAX_FILE_SIZE) throw new Error('El archivo no debe superar los 10MB');
+
       setIsLoading(true);
 
-      // 1. Generar nombre único
+      // Generar nombre único
       const fileExt = file.name.split('.').pop();
       const fileName = `${uuidv4()}.${fileExt}`;
 
-      // 2. Subir archivo a Supabase Storage
+      // Paso A: Subir archivo a Supabase Storage
       const { error: uploadError } = await supabase.storage
         .from(BUCKET_NAME)
         .upload(fileName, file, {
           cacheControl: '3600',
-          upsert: false
+          upsert: false,
         });
 
       if (uploadError) {
         throw new Error(`Error al subir archivo: ${uploadError.message}`);
       }
 
-      // 3. Insertar en la tabla documents
-      const { data: documentArr, error: dbError } = await supabase
-        .from('documents')
-        .insert([{ file_name: fileName, status: 'pending' }])
-        .select();
-      const document = documentArr?.[0];
-
-      if (dbError) {
-        // Si falla la inserción, intentamos eliminar el archivo subido
-        await supabase.storage.from(BUCKET_NAME).remove([fileName]);
-        throw new Error(`Error en base de datos: ${dbError.message}`);
-      }
-
-      if (!document) {
-        throw new Error('No se pudo crear el registro del documento');
-      }
-
-      // 4. Activar webhook de n8n
-      const response = await fetch(process.env.NEXT_PUBLIC_N8N_WEBHOOK_URL, {
+      // Paso D: Llamar a la nueva API Route /api/ingest
+      const ingestResponse = await fetch('/api/ingest', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({
-          document_id: document.id,
-          file_path: fileName
-        }),
+        body: JSON.stringify({ fileName }),
       });
 
-      if (!response.ok) {
-        // Si falla el webhook, marcar el documento como error
-        await supabase
-          .from('documents')
-          .update({ status: 'error' })
-          .eq('id', document?.id);
-        throw new Error(`Error en webhook: ${await response.text()}`);
+      if (!ingestResponse.ok) {
+        // Intentar borrar el archivo subido si falla la ingestión
+        await supabase.storage.from(BUCKET_NAME).remove([fileName]);
+        const errorData = await ingestResponse.json();
+        throw new Error(errorData?.error || 'Error al procesar el documento');
       }
 
       toast.success('¡Archivo subido! El procesamiento ha comenzado.');
-
-      // Limpiar el formulario
       form.reset();
-
-    } catch (error) {
+    } catch (error: any) {
       console.error('Error:', error);
-      toast.error('Hubo un error al procesar tu archivo');
+      toast.error(error?.message || 'Hubo un error al procesar tu archivo');
     } finally {
       setIsLoading(false);
     }
